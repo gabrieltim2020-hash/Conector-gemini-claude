@@ -1,180 +1,169 @@
-// Ponte Gemini -> Claude (servidor MCP remoto para a Vercel)
-// O Claude chama a ferramenta "gemini_escrever"; este arquivo repassa o pedido
-// para a API do Gemini (usando a SUA chave e a cota grátis do Google) e devolve o texto.
-//
-// Variáveis de ambiente (configure no painel da Vercel, NUNCA no código):
-//   GEMINI_API_KEY  -> sua chave do Google AI Studio
-//   MCP_SECRET      -> uma senha longa inventada por você (protege sua cota)
-//   GEMINI_MODELS   -> opcional; ordem do plano B. Padrão "gemini-pro-latest,gemini-flash-latest"
+// Ponte Gemini -> Claude (servidor MCP remoto para Vercel)
 
-const PROTOCOLO_PADRAO = "2025-06-18";
+const PROTOCOL_VERSION = "2024-11-05";
 
-const FERRAMENTA = {
+const TOOL = {
   name: "gemini_escrever",
-  description:
-    "Pede ao Google Gemini para ESCREVER um rascunho (código Python/JS/HTML, textos, " +
-    "resumos, roteiros, etc.). Use para tarefas de escrita longas; depois o Claude revisa. " +
-    "Se a resposta começar com COTA_GEMINI_ESGOTADA, o Claude deve fazer a tarefa sozinho.",
+  description: "Pede ao Google Gemini para ESCREVER um rascunho (código Python/JS/HTML, textos, currículos, roteiros, etc.). Use para tarefas de escrita longas; depois o Claude revisa. Se a resposta começar com COTA_GEMINI_ESGOTADA, o Claude deve fazer a tarefa sozinho.",
   inputSchema: {
     type: "object",
     properties: {
       tarefa: {
         type: "string",
-        description: "O que o Gemini deve escrever, com todos os requisitos.",
+        description: "O que o Gemini deve escrever, com todos os requisitos."
       },
       contexto: {
         type: "string",
-        description: "Opcional: código existente, trechos de arquivos ou regras do projeto.",
+        description: "Opcional: código existente, trechos de arquivos ou regras do projeto."
       },
       modelo: {
         type: "string",
-        description: "Opcional: modelo para tentar primeiro (ex.: gemini-flash-latest). Se omitido, tenta Pro e cai para Flash no erro 429.",
-      },
+        description: "Opcional: modelo para tentar primeiro (ex.: gemini-flash-latest). Se omitido, tenta Pro e cai para Flash no erro 429."
+      }
     },
-    required: ["tarefa"],
-  },
+    required: ["tarefa"]
+  }
 };
 
-function resposta(id, result) {
+function response(id, result) {
   return { jsonrpc: "2.0", id, result };
 }
-function erro(id, code, message) {
+
+function error(id, code, message) {
   return { jsonrpc: "2.0", id, error: { code, message } };
 }
-function textoFerramenta(texto, isError = false) {
-  return { content: [{ type: "text", text: texto }], isError };
+
+function toolText(text, isError = false) {
+  return { content: [{ type: "text", text: text }], isError };
 }
 
-// PLANO B: ordem de tentativa dos modelos.
-// 1º o Pro (respostas mais complexas); se der 429 (cota/excesso de pedidos),
-// tenta o Flash (cota grátis maior). Dá para mudar sem mexer no código,
-// criando na Vercel a variável GEMINI_MODELS="modeloA,modeloB,modeloC".
-const MODELOS_PADRAO = ["gemini-pro-latest", "gemini-flash-latest"];
+const DEFAULT_MODELS = ["gemini-pro-latest", "gemini-flash-latest"];
 
-function listaDeModelos(modeloPedido) {
-  const daVercel = (process.env.GEMINI_MODELS || "")
-    .split(",").map((m) => m.trim()).filter(Boolean);
-  const base = daVercel.length ? daVercel : MODELOS_PADRAO;
-  const lista = modeloPedido ? [modeloPedido, ...base] : base;
-  return [...new Set(lista)]; // remove repetidos
+function getModelList(requestedModel) {
+  const fromVercel = (process.env.GEMINI_MODELS || "")
+    .split(",").map(m => m.trim()).filter(Boolean);
+  const base = fromVercel.length ? fromVercel : DEFAULT_MODELS;
+  const list = requestedModel ? [requestedModel, ...base] : base;
+  return [...new Set(list)];
 }
 
-async function tentarModelo(model, chave, prompt) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+async function tryModel(model, key, prompt) {
+  const URL = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
   try {
-    const r = await fetch(url, {
+    const r = await fetch(URL, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "x-goog-api-key": chave },
-      body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }] }),
+      headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+      body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: prompt }] }] })
     });
     return { r };
   } catch (e) {
-    return { erroRede: e.message };
+    return { netError: e.message };
   }
 }
 
-async function chamarGemini({ tarefa, contexto, modelo }) {
-  const chave = process.env.GEMINI_API_KEY;
-  if (!chave) return textoFerramenta("ERRO_CONFIG: GEMINI_API_KEY não configurada na Vercel.", true);
+async function callGemini({ tarefa, contexto, modelo }) {
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) return toolText("ERRO_CONFIG: GEMINI_API_KEY não configurado no Vercel.", true);
 
-  const prompt =
-    (contexto ? `CONTEXTO:\n${contexto}\n\n` : "") +
-    `TAREFA:\n${tarefa}\n\n` +
-    "Responda em português do Brasil. Se for código, entregue o código completo e funcional.";
+  const prompt = (contexto ? `CONTEXTO:\n${contexto}\n\n` : "") +
+                 `TAREFA:\n${tarefa}\n\n` +
+                 "Responda em português do Brasil. Se for código, entregue o código completo e funcional.";
 
-  const tentativas = []; // histórico: "gemini-pro-latest → 429"
+  const attemptLogs = [];
 
-  for (const model of listaDeModelos(modelo)) {
-    const { r, erroRede } = await tentarModelo(model, chave, prompt);
-
-    if (erroRede) {
-      return textoFerramenta(`GEMINI_INDISPONIVEL: falha de rede (${erroRede}). Claude deve fazer sozinho.`, true);
+  for (const m of getModelList(modelo)) {
+    const { r, netError } = await tryModel(m, key, prompt);
+    
+    if (netError) {
+      return toolText(`GEMINI_INDISPONIVEL: falha de rede (${netError}). Claude deve fazer sozinho.`, true);
     }
 
-    // 429 = cota esgotada ou muitas requisições → plano B: próximo modelo
     if (r.status === 429) {
-      tentativas.push(`${model} → 429 (cota)`);
+      attemptLogs.push(`${m} -> 429 (cota)`);
       continue;
     }
-    // 404 = modelo não existe mais/não liberado para sua chave → também pula
     if (r.status === 404) {
-      tentativas.push(`${model} → 404 (modelo indisponível)`);
+      attemptLogs.push(`${m} -> 404 (modelo indisponível)`);
       continue;
     }
     if (!r.ok) {
-      const corpo = (await r.text()).slice(0, 500);
-      return textoFerramenta(`GEMINI_ERRO ${r.status} no modelo ${model}: ${corpo}`, true);
+      const body = await r.text().catch(() => "").slice(0, 500);
+      return toolText(`GEMINI_ERRO_${r.status}_${m}: ${body}`, true);
     }
 
-    const dados = await r.json();
-    const partes = dados?.candidates?.[0]?.content?.parts || [];
-    const texto = partes.map((p) => p.text || "").join("").trim();
-    if (!texto) {
-      const motivo = dados?.candidates?.[0]?.finishReason || dados?.promptFeedback?.blockReason || "desconhecido";
-      return textoFerramenta(`GEMINI_SEM_RESPOSTA no modelo ${model} (motivo: ${motivo}). Claude deve fazer sozinho.`, true);
+    const data = await r.json();
+    const parts = data?.candidates?.[0]?.content?.parts || [];
+    const text = parts.map(p => p.text || "").join("").trim();
+    
+    if (!text) {
+      const reason = data?.candidates?.[0]?.finishReason || data?.promptFeedback?.blockReason || "desconhecido";
+      return toolText(`GEMINI_SEM_RESPOSTA_${m} (motivo: ${reason}). Claude deve fazer sozinho.`, true);
     }
 
-    const aviso = tentativas.length ? ` | plano B usado: ${tentativas.join("; ")}` : "";
-    return textoFerramenta(`[Rascunho do Gemini — modelo ${model}${aviso}]\n\n${texto}`);
+    const warning = attemptLogs.length ? ` | Plano B usado: ${attemptLogs.join("; ")}` : "";
+    return toolText(`[Rascunho do Gêmeos - modelo: ${m}${warning}]\n\n${text}`);
   }
 
-  // Todos os modelos falharam com 429/404
-  return textoFerramenta(
-    `COTA_GEMINI_ESGOTADA: nenhum modelo disponível (${tentativas.join("; ")}). Claude deve fazer a tarefa sozinho.`,
-    true
-  );
+  return toolText(`COTA_GEMINI_ESGOTADA: nenhum modelo disponível (${attemptLogs.join("; ")}). Claude deve fazer a tarefa sozinho.`, true);
 }
 
-async function tratarMensagem(msg) {
-  const { id, method, params } = msg || {};
-  const ehNotificacao = id === undefined || id === null;
+async function handleMessage(message) {
+  const { id, method, params } = message || {};
+  const isNotification = id === undefined || id === null;
 
   if (method === "initialize") {
-    return resposta(id, {
-      protocolVersion: params?.protocolVersion || PROTOCOLO_PADRAO,
+    return response(id, {
+      protocolVersion: params?.protocolVersion || PROTOCOL_VERSION,
       capabilities: { tools: {} },
-      serverInfo: { name: "ponte-gemini", version: "1.0.0" },
+      serverInfo: { name: "ponte-gemeos", version: "1.0.0" }
     });
   }
-  if (ehNotificacao) return null; // ex.: notifications/initialized
-  if (method === "ping") return resposta(id, {});
-  if (method === "tools/list") return resposta(id, { tools: [FERRAMENTA] });
+
+  if (isNotification) return null;
+  if (method === "ping") return response(id, {});
+  if (method === "tools/list") return response(id, { tools: [TOOL] });
   if (method === "tools/call") {
-    if (params?.name !== FERRAMENTA.name) return erro(id, -32602, "Ferramenta desconhecida");
+    if (params?.name !== TOOL.name) return error(id, -32602, "Ferramenta desconhecida");
     const args = params.arguments || {};
-    if (!args.tarefa) return resposta(id, textoFerramenta("Faltou o campo 'tarefa'.", true));
-    return resposta(id, await chamarGemini(args));
+    if (!args.tarefa) return response(id, toolText("Faltou o campo 'tarefa'.", true));
+    return response(id, await callGemini(args));
   }
-  return erro(id, -32601, `Método não suportado: ${method}`);
+
+  return error(id, -32601, `Método não suportado: ${method}`);
 }
 
 export default async function handler(req, res) {
-  // Senha simples na URL: https://seu-projeto.vercel.app/api/mcp?key=SUA_SENHA
-  const segredo = process.env.MCP_SECRET;
+  const secret = process.env.MCP_SECRET;
   const url = new URL(req.url, "http://localhost");
-  if (!segredo || url.searchParams.get("key") !== segredo) {
-    return res.status(401).json({ error: "Não autorizado" });
+  
+  if (secret) {
+      const authHeader = req.headers.authorization;
+      const queryKey = url.searchParams.get("key");
+      if (authHeader !== `Bearer ${secret}` && queryKey !== secret) {
+          return res.status(401).json({ error: "Não autorizado" });
+      }
   }
 
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST");
-    return res.status(405).json({ error: "Use POST" });
+    return res.status(405).json({ error: "Usar POST" });
   }
 
-  let corpo = req.body;
-  if (typeof corpo === "string") {
-    try { corpo = JSON.parse(corpo); } catch { return res.status(400).json(erro(null, -32700, "JSON inválido")); }
+  let body = req.body;
+  if (typeof body === "string") {
+    try { body = JSON.parse(body); } 
+    catch (e) { return res.status(400).json(error(null, -32700, "JSON inválido")); }
   }
 
-  if (Array.isArray(corpo)) {
-    const saidas = (await Promise.all(corpo.map(tratarMensagem))).filter(Boolean);
-    if (saidas.length === 0) return res.status(202).end();
-    return res.status(200).json(saidas);
+  if (Array.isArray(body)) {
+    const results = (await Promise.all(body.map(handleMessage))).filter(Boolean);
+    if (results.length === 0) return res.status(202).end();
+    return res.status(200).json(results);
   }
 
-  const saida = await tratarMensagem(corpo);
-  if (!saida) return res.status(202).end();
-  return res.status(200).json(saida);
+  const result = await handleMessage(body);
+  if (!result) return res.status(202).end();
+  return res.status(200).json(result);
 }
 
 export const config = { maxDuration: 60 };
