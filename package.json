@@ -1,0 +1,8 @@
+{
+  "name": "ponte-gemini",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Servidor MCP remoto: o Claude pede, o Gemini escreve, o Claude revisa.",
+  "engines": { "node": ">=18" }
+}
